@@ -22,6 +22,7 @@ use selector_parser::{SelectorImpl, SelectorParser};
 use selectors::parser::SelectorList;
 use servo_config::prefs::PREFS;
 use servo_url::ServoUrl;
+use shared_lock::{SharedRwLock, Locked, SharedRwLockReadGuard};
 use std::cell::Cell;
 use std::fmt;
 use std::str;
@@ -177,11 +178,13 @@ pub struct Stylesheet {
     /// cascading order)
     pub rules: Arc<RwLock<CssRules>>,
     /// List of media associated with the Stylesheet.
-    pub media: Arc<RwLock<MediaList>>,
+    pub media: Arc<Locked<MediaList>>,
     /// The origin of this stylesheet.
     pub origin: Origin,
     /// The base url this stylesheet should use.
     pub base_url: ServoUrl,
+    /// The lock used for objects inside this stylesheet
+    pub shared_lock: SharedRwLock,
     /// The namespaces that apply to this stylesheet.
     pub namespaces: RwLock<Namespaces>,
     /// Whether this stylesheet would be dirty when the viewport size changes.
@@ -296,12 +299,12 @@ impl CssRule {
     /// used for others.
     ///
     /// This will not recurse down unsupported @supports rules
-    pub fn with_nested_rules_and_mq<F, R>(&self, mut f: F) -> R
+    pub fn with_nested_rules_and_mq<F, R>(&self, guard: &SharedRwLockReadGuard, mut f: F) -> R
     where F: FnMut(&[CssRule], Option<&MediaList>) -> R {
         match *self {
             CssRule::Import(ref lock) => {
                 let rule = lock.read();
-                let media = rule.stylesheet.media.read();
+                let media = rule.stylesheet.media.read_with(guard);
                 let rules = rule.stylesheet.rules.read();
                 // FIXME(emilio): Include the nested rules if the stylesheet is
                 // loaded.
@@ -354,6 +357,7 @@ impl CssRule {
         let mut rule_parser = TopLevelRuleParser {
             stylesheet_origin: parent_stylesheet.origin,
             context: context,
+            shared_lock: &parent_stylesheet.shared_lock,
             loader: None,
             state: Cell::new(state),
             namespaces: &mut namespaces,
@@ -429,7 +433,8 @@ impl ToCss for ImportRule {
     fn to_css<W>(&self, dest: &mut W) -> fmt::Result where W: fmt::Write {
         try!(dest.write_str("@import "));
         try!(self.url.to_css(dest));
-        let media = self.stylesheet.media.read();
+        let guard = self.stylesheet.shared_lock.read();  // FIXME: have the caller pass this?
+        let media = self.stylesheet.media.read_with(&guard);
         if !media.is_empty() {
             try!(dest.write_str(" "));
             try!(media.to_css(dest));
@@ -582,6 +587,7 @@ impl Stylesheet {
                       environment_encoding: Option<EncodingRef>,
                       origin: Origin,
                       media: MediaList,
+                      shared_lock: SharedRwLock,
                       stylesheet_loader: Option<&StylesheetLoader>,
                       error_reporter: Box<ParseErrorReporter + Send>,
                       extra_data: ParserContextExtraData)
@@ -592,6 +598,7 @@ impl Stylesheet {
                              base_url,
                              origin,
                              media,
+                             shared_lock,
                              stylesheet_loader,
                              error_reporter,
                              extra_data)
@@ -630,6 +637,7 @@ impl Stylesheet {
         let rule_parser = TopLevelRuleParser {
             stylesheet_origin: existing.origin,
             namespaces: &mut namespaces,
+            shared_lock: &existing.shared_lock,
             loader: stylesheet_loader,
             context: ParserContext::new_with_extra_data(existing.origin,
                                                         &existing.base_url,
@@ -667,6 +675,7 @@ impl Stylesheet {
                     base_url: ServoUrl,
                     origin: Origin,
                     media: MediaList,
+                    shared_lock: SharedRwLock,
                     stylesheet_loader: Option<&StylesheetLoader>,
                     error_reporter: Box<ParseErrorReporter + Send>,
                     extra_data: ParserContextExtraData) -> Stylesheet {
@@ -675,7 +684,8 @@ impl Stylesheet {
             base_url: base_url,
             namespaces: RwLock::new(Namespaces::default()),
             rules: CssRules::new(vec![]),
-            media: Arc::new(RwLock::new(media)),
+            media: Arc::new(shared_lock.wrap(media)),
+            shared_lock: shared_lock.clone(),
             dirty_on_viewport_size_change: AtomicBool::new(false),
             disabled: AtomicBool::new(false),
         };
@@ -714,7 +724,8 @@ impl Stylesheet {
     ///
     /// Always true if no associated MediaList exists.
     pub fn is_effective_for_device(&self, device: &Device) -> bool {
-        self.media.read().evaluate(device)
+        let guard = self.shared_lock.read();  // FIXME: have the caller pass this?
+        self.media.read_with(&guard).evaluate(device)
     }
 
     /// Return an iterator over the effective rules within the style-sheet, as
@@ -725,7 +736,8 @@ impl Stylesheet {
     /// examined.
     #[inline]
     pub fn effective_rules<F>(&self, device: &Device, mut f: F) where F: FnMut(&CssRule) {
-        effective_rules(&self.rules.read().0, device, &mut f);
+        let guard = self.shared_lock.read();  // FIXME: have the caller pass this?
+        effective_rules(&self.rules.read().0, device, &guard, &mut f);
     }
 
     /// Returns whether the stylesheet has been explicitly disabled through the
@@ -746,16 +758,17 @@ impl Stylesheet {
     }
 }
 
-fn effective_rules<F>(rules: &[CssRule], device: &Device, f: &mut F) where F: FnMut(&CssRule) {
+fn effective_rules<F>(rules: &[CssRule], device: &Device, guard: &SharedRwLockReadGuard, f: &mut F)
+where F: FnMut(&CssRule) {
     for rule in rules {
         f(rule);
-        rule.with_nested_rules_and_mq(|rules, mq| {
+        rule.with_nested_rules_and_mq(guard, |rules, mq| {
             if let Some(media_queries) = mq {
                 if !media_queries.evaluate(device) {
                     return
                 }
             }
-            effective_rules(rules, device, f)
+            effective_rules(rules, device, guard, f)
         })
     }
 }
@@ -800,6 +813,7 @@ pub trait StylesheetLoader {
 struct TopLevelRuleParser<'a> {
     stylesheet_origin: Origin,
     namespaces: &'a mut Namespaces,
+    shared_lock: &'a SharedRwLock,
     loader: Option<&'a StylesheetLoader>,
     context: ParserContext<'a>,
     state: Cell<State>,
@@ -856,7 +870,7 @@ impl<'a> AtRuleParser for TopLevelRuleParser<'a> {
                                                              &self.context));
 
                     let media =
-                        Arc::new(RwLock::new(parse_media_query_list(input)));
+                        Arc::new(self.shared_lock.wrap(parse_media_query_list(input)));
 
                     let is_valid_url = url.url().is_some();
 
@@ -866,6 +880,7 @@ impl<'a> AtRuleParser for TopLevelRuleParser<'a> {
                             stylesheet: Arc::new(Stylesheet {
                                 rules: Arc::new(RwLock::new(CssRules(vec![]))),
                                 media: media,
+                                shared_lock: self.shared_lock.clone(),
                                 origin: self.context.stylesheet_origin,
                                 base_url: self.context.base_url.clone(),
                                 namespaces: RwLock::new(Namespaces::default()),

@@ -132,6 +132,7 @@ use style::attr::AttrValue;
 use style::context::{QuirksMode, ReflowGoal};
 use style::restyle_hints::{RestyleHint, RESTYLE_STYLE_ATTRIBUTE};
 use style::selector_parser::{RestyleDamage, Snapshot};
+use style::shared_lock::SharedRwLock as StyleSharedRwLock;
 use style::str::{HTML_SPACE_CHARACTERS, split_html_space_chars, str_join};
 use style::stylesheets::Stylesheet;
 use task_source::TaskSource;
@@ -218,6 +219,7 @@ pub struct Document {
     scripts: MutNullableJS<HTMLCollection>,
     anchors: MutNullableJS<HTMLCollection>,
     applets: MutNullableJS<HTMLCollection>,
+    style_shared_lock: StyleSharedRwLock,
     /// List of stylesheets associated with nodes in this document. |None| if the list needs to be refreshed.
     stylesheets: DOMRefCell<Option<Vec<StylesheetInDocument>>>,
     /// Whether the list of stylesheets has changed since the last reflow was triggered.
@@ -2058,6 +2060,7 @@ impl Document {
             scripts: Default::default(),
             anchors: Default::default(),
             applets: Default::default(),
+            style_shared_lock: StyleSharedRwLock::new(),
             stylesheets: DOMRefCell::new(None),
             stylesheets_changed_since_reflow: Cell::new(false),
             stylesheet_list: MutNullableJS::new(None),
@@ -2184,6 +2187,11 @@ impl Document {
                 })
                 .collect());
         };
+    }
+
+    /// Return a reference to the per-document shared lock used in stylesheets.
+    pub fn style_shared_lock(&self) -> &StyleSharedRwLock {
+        &self.style_shared_lock
     }
 
     /// Returns the list of stylesheets associated with nodes in the document.

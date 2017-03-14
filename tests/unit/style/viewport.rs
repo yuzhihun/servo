@@ -10,6 +10,7 @@ use servo_url::ServoUrl;
 use style::error_reporting::ParseErrorReporter;
 use style::media_queries::{Device, MediaType};
 use style::parser::{ParserContext, ParserContextExtraData};
+use style::shared_lock::SharedRwLock;
 use style::stylesheets::{Stylesheet, Origin};
 use style::values::specified::LengthOrPercentageOrAuto::{self, Auto};
 use style::values::specified::NoCalcLength::{self, ViewportPercentage};
@@ -25,6 +26,7 @@ macro_rules! stylesheet {
             ServoUrl::parse("http://localhost").unwrap(),
             Origin::$origin,
             Default::default(),
+            SharedRwLock::new(),
             None,
             $error_reporter,
             ParserContextExtraData::default()
